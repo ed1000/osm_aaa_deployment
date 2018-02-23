@@ -1,0 +1,101 @@
+#!/bin/bash
+
+KEYSTONE_LXC_IP=''
+AUTHORIZATION_IP=''
+ACCOUNTING_IP=''
+
+KEYSTONE_USERNAME=''
+KEYSTONE_PASSWORD=''
+KEYSTONE_PROJECT=''
+KEYSTONE_ADMIN_PROJECT=''
+KEYSTONE_SERVICE_PROJECT=''
+KEYSTONE_USER_DOMAIN_NAME=''
+KEYSTONE_PROJECT_DOMAIN_NAME=''
+
+EXTERNAL_MAPPING_VERIFICATION=''
+EXTERNAL_AUTHENTICATOR_IP=''
+
+AUTH_LXC_IP=`ifconfig eth0 | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*'`
+
+echo '>>>>>> Updating repositories Authentication LXC Container'
+apt update
+
+echo '>>>>>> Upgrading packages Authentication LXC Container'
+apt upgrade -y
+
+echo '>>>>>> Autoremoving packages Authentication LXC Container'
+apt autoremove -y
+
+echo '>>>>>> Installing Packages'
+apt install -y python3-pip python3-dev nginx git git-core
+
+echo '>>>>>> Installing PIP Packages'
+pip3 install gunicorn
+
+echo '>>>>>> Configuring Gunicron SystemD Unit'
+cat << EOF >> /etc/systemd/system/gunicorn.service 
+[Unit]
+Description=gunicorn daemon
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=www-data
+WorkingDirectory=/home/ubuntu/authentication
+ExecStart=/usr/local/bin/gunicorn --access-logfile - --workers 3 --bind unix:/home/ubuntu/authentication/authentication.sock authentication:app 
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo '>>>>>> Configuring Nginx'
+rm /etc/nginx/sites-enabled/default
+
+cat << EOF >> /etc/nginx/sites-available/authentication
+server {
+  listen 80;
+  server_name $AUTH_LXC_IP;
+
+  location / {
+    include proxy_params;
+    proxy_pass http://unix:/home/ubuntu/authentication/authentication.sock;
+  }
+}
+EOF
+
+ln -s /etc/nginx/sites-available/authentication /etc/nginx/sites-enabled
+
+echo '>>>>>> Changing to ubuntu user'
+cd /home/ubuntu
+
+echo '>>>>>> Getting the code'
+git clone https://github.com/ed1000/osm_authentication.git authentication
+chown -R ubuntu:ubuntu authentication
+
+echo '>>>>>> Installing requirements'
+cd authentication/
+pip3 install -r requirements.txt
+
+echo '>>>>>> Configuring Authentication'
+sed -i "s/AUTHORIZATION_IP =.*/AUTHORIZATION_IP = '$AUTHORIZATION_IP'/" settings.py
+sed -i "s/ACCOUNTING_IP =.*/ACCOUNTING_IP = '$ACCOUNTING_IP'/" settings.py
+
+sed -i "s/KEYSTONE_URL =.*/KEYSTONE_URL = 'http:\/\/$KEYSTONE_LXC_IP:35357\/v3\/'/" settings.py
+sed -i "s/KEYSTONE_USERNAME =.*/KEYSTONE_USERNAME = '$KEYSTONE_USERNAME'/" settings.py
+sed -i "s/KEYSTONE_PASSWORD =.*/KEYSTONE_PASSWORD = '$KEYSTONE_PASSWORD'/" settings.py
+sed -i "s/KEYSTONE_PROJECT =.*/KEYSTONE_PROJECT = '$KEYSTONE_PROJECT'/" settings.py
+sed -i "s/KEYSTONE_ADMIN_PROJECT =.*/KEYSTONE_ADMIN_PROJECT = '$KEYSTONE_ADMIN_PROJECT'/" settings.py
+sed -i "s/KEYSTONE_SERVICE_PROJECT =.*/KEYSTONE_SERVICE_PROJECT = '$KEYSTONE_SERVICE_PROJECT'/" settings.py
+sed -i "s/KEYSTONE_USER_DOMAIN_NAME =.*/KEYSTONE_USER_DOMAIN_NAME = '$KEYSTONE_USER_DOMAIN_NAME'/" settings.py
+sed -i "s/KEYSTONE_PROJECT_DOMAIN_NAME =.*/KEYSTONE_PROJECT_DOMAIN_NAME = '$KEYSTONE_PROJECT_DOMAIN_NAME'/" settings.py
+
+sed -i "s/EXTERNAL_MAPPING_VERIFICATION =.*/EXTERNAL_MAPPING_VERIFICATION = $EXTERNAL_MAPPING_VERIFICATION/" settings.py
+sed -i "s/EXTERNAL_AUTHENTICATOR_IP =.*/EXTERNAL_AUTHENTICATOR_IP = '$EXTERNAL_AUTHENTICATOR_IP'/" settings.py
+
+echo '>>>>>> Starting Gunicorn SystemD Unit'
+systemctl daemon-reload
+systemctl start gunicorn
+systemctl enable gunicorn
+systemctl restart nginx
+

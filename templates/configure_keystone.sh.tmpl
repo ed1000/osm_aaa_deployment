@@ -1,0 +1,154 @@
+#!/bin/bash
+
+MYSQL_ROOT_PASSWORD=''
+KEYSTONE_DB_PASSWORD=''
+ADMIN_PASSWORD=''
+
+SO_PASSWORD=''
+RO_PASSWORD=''
+VCA_PASSWORD=''
+
+USER_5GINFIRE_PASSWORD=''
+ADMIN_5GINFIRE_PASSWORD=''
+
+AUTHENTICATION_PASSWORD=''
+AUTHORIZATION_PASSWORD=''
+
+KEYSTONE_LXC_IP=`ifconfig eth0 | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*'`
+
+echo '>>>>>> Updating repositories Keystone LXC Container'
+apt update
+
+echo '>>>>>> Upgrading packages Keystone LXC Container'
+apt upgrade -y
+
+echo '>>>>>> Autoremoving packages Keystone LXC Container'
+apt autoremove -y
+
+echo '>>>>>> Installing Software Properties Common'
+apt install -y software-properties-common
+
+echo '>>>>>> Adding Ocata Repositories'
+add-apt-repository -y cloud-archive:ocata
+
+echo '>>>>>> Updating repositories Keystone LXC Container'
+apt update
+
+echo '>>>>>> Dist-Upgrading packages Keystone LXC Container'
+apt dist-upgrade -y
+
+echo '>>>>>> Installing python-openstackclient'
+apt install -y python-openstackclient
+
+echo '>>>>>> Installing mysql'
+apt install -y mariadb-server python-pymysql
+
+echo '>>>>>> Pushing MySQL configuration file to Keystone LXC Container'
+cat << 'EOF' >> /etc/mysql/mariadb.conf.d/99-openstack.cnf
+[mysqld]
+bind-address = 127.0.0.1
+
+default-storage-engine = innodb
+innodb_file_per_table = on
+max_connections = 4096
+collation-server = utf8_general_ci
+character-set-server = utf8
+EOF
+
+chown root:root /etc/mysql/mariadb.conf.d/99-openstack.cnf
+
+echo '>>>>>> Restarting MySQL service'
+service mysql restart
+
+echo '>>>>>> Executing MySQL Secure Installation protocol'
+mysqladmin -u root password "$MYSQL_ROOT_PASSWORD"
+mysql -ne "FLUSH PRIVILEGES"
+mysql -ne "DELETE FROM mysql.user WHERE User=''"
+mysql -ne "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1')"
+mysql -ne "DROP DATABASE test"
+mysql -ne "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%'"
+mysql -ne "FLUSH PRIVILEGES"
+
+echo '>>>>>> Creating Keystone DB'
+mysql -ne "CREATE DATABASE keystone"
+mysql -ne "GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY '$KEYSTONE_DB_PASSWORD'"
+mysql -ne "GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%' IDENTIFIED BY '$KEYSTONE_DB_PASSWORD'"
+
+echo '>>>>>> Installing Keystone'
+apt install -y keystone
+
+echo '>>>>>> Setting Keystone database connection'
+sed -i "713s/.*/connection = mysql+pymysql:\/\/keystone:$KEYSTONE_DB_PASSWORD@127.0.0.1\/keystone/" \
+    /etc/keystone/keystone.conf
+
+echo '>>>>>> Setting Keystone tokens'
+sed -i "2842s/.*/provider = fernet/" /etc/keystone/keystone.conf
+
+echo '>>>>>> Populate Keystone database'
+su -s /bin/sh -c "keystone-manage db_sync" keystone
+
+echo '>>>>>> Initialize Fernet key repositories'
+keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+keystone-manage credential_setup --keystone-user keystone --keystone-group keystone
+
+echo '>>>>>> Bootstrap Keystone service'
+keystone-manage bootstrap --bootstrap-password "$ADMIN_PASSWORD" \
+    --bootstrap-admin-url http://"$KEYSTONE_LXC_IP":35357/v3/ \
+    --bootstrap-internal-url http://"$KEYSTONE_LXC_IP":5000/v3/ \
+    --bootstrap-public-url http://"$KEYSTONE_LXC_IP":5000/v3/ \
+    --bootstrap-region-id RegionOne
+
+echo '>>>>>> Restart Apache Service'
+service apache2 restart
+
+echo '>>>>>> Remove Keystone SQLite database'
+rm -f /var/lib/keystone/keystone.db
+
+sed -i "63s/admin_token_auth//" /etc/keystone/keystone-paste.ini
+sed -i "68s/admin_token_auth//" /etc/keystone/keystone-paste.ini
+sed -i "73s/admin_token_auth//" /etc/keystone/keystone-paste.ini
+
+cat << EOF >> setup_env
+export OS_PROJECT_DOMAIN_NAME=Default
+export OS_USER_DOMAIN_NAME=Default
+export OS_PROJECT_NAME=admin
+export OS_USERNAME=admin
+export OS_PASSWORD=$ADMIN_PASSWORD
+export OS_AUTH_URL=http://$KEYSTONE_LXC_IP:35357/v3
+export OS_IDENTITY_API_VERSION=3
+export OS_IMAGE_API_VERSION=2
+EOF
+
+source setup_env
+
+openstack project create --domain default --description "Service Project" service
+openstack project create --domain default --description "5GinFIRE Project" 5ginfire
+
+openstack role create user
+
+openstack group create users
+openstack group create admins
+
+openstack user create --domain default --password "$SO_PASSWORD" so
+openstack user create --domain default --password "$RO_PASSWORD" ro
+openstack user create --domain default --password "$VCA_PASSWORD" vca
+openstack user create --domain default --password "$AUTHENTICATION_PASSWORD" authentication
+openstack user create --domain default --password "$AUTHORIZATION_PASSWORD" authorization
+
+openstack user create --domain default --password "$USER_5GINFIRE_PASSWORD" user_5ginfire
+openstack user create --domain default --password "$ADMIN_5GINFIRE_PASSWORD" admin_5ginfire
+
+openstack role add --project service --user so admin
+openstack role add --project service --user ro admin
+openstack role add --project service --user so admin
+openstack role add --project service --user authentication admin
+openstack role add --project service --user authorization admin
+
+openstack role add --project 5ginfire --user user_5ginfire user
+openstack role add --project 5ginfire --user admin_5ginfire admin
+
+openstack group add user users user_5ginfire
+
+openstack group add user admins admin_5ginfire
+
+rm setup_env

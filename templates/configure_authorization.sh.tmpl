@@ -1,0 +1,156 @@
+#!/bin/bash
+
+KEYSTONE_LXC_IP=''
+AUTHENTICATION_IP=''
+ACCOUNTING_IP=''
+
+AUTHENTICATION_USERNAME=''
+AUTHENTICATION_PASSWORD=''
+
+AUTHORIZATION_POLICY_FILE=''
+REDIS_URL=''
+REDIS_PORT=''
+
+SERVICE_ROLE=''
+SERVICE_PROJECT=''
+
+KEYSTONE_USERNAME=''
+KEYSTONE_PASSWORD=''
+KEYSTONE_PROJECT=''
+KEYSTONE_ADMIN_PROJECT=''
+KEYSTONE_SERVICE_PROJECT=''
+KEYSTONE_USER_DOMAIN_NAME=''
+KEYSTONE_PROJECT_DOMAIN_NAME=''
+
+AUTH_LXC_IP=`ifconfig eth0 | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*'`
+
+echo '>>>>>> Updating repositories Authentication LXC Container'
+apt update
+
+echo '>>>>>> Upgrading packages Authentication LXC Container'
+apt upgrade -y
+
+echo '>>>>>> Autoremoving packages Authentication LXC Container'
+apt autoremove -y
+
+echo '>>>>>> Installing Packages'
+apt install -y python3-pip python3-dev nginx git git-core
+
+echo '>>>>>> Installing Redis'
+apt install -y build-essential tcl
+cd /tmp
+curl -O http://download.redis.io/redis-stable.tar.gz
+tar xzvf redis-stable.tar.gz
+cd redis-stable
+make
+make test
+make install
+
+echo '>>>>>> Configuring Redis'
+mkdir /etc/redis
+cp /tmp/redis-stable/redis.conf /etc/redis
+sed -i "s/^supervised no/supervised systemd/" /etc/redis/redis.conf
+sed -i "s/^dir \.\//dir \/var\/lib\/redis/" /etc/redis/redis.conf
+
+echo '>>>>>> Configuring Redis Systemd Unit'
+cat << EOF >> /etc/systemd/system/redis.service 
+[Unit]
+Description=Redis In-memory Data Store
+After=network.target
+
+[Service]
+User=redis
+Group=redis
+ExecStart=/usr/local/bin/redis-server /etc/redis/redis.conf
+ExecStop=/usr/local/bin/redis-cli shutdown
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+adduser --system --group --no-create-home redis
+mkdir /var/lib/redis
+chown redis:redis /var/lib/redis
+chmod 770 /var/lib/redis
+
+systemctl start redis
+systemctl enable redis
+
+echo '>>>>>> Installing PIP Packages'
+pip3 install gunicorn
+
+echo '>>>>>> Configuring Gunicron SystemD Unit'
+cat << EOF >> /etc/systemd/system/gunicorn.service 
+[Unit]
+Description=gunicorn daemon
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=www-data
+WorkingDirectory=/home/ubuntu/authorization
+ExecStart=/usr/local/bin/gunicorn --access-logfile - --workers 3 --bind unix:/home/ubuntu/authorization/authorization.sock authorization:app 
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo '>>>>>> Configuring Nginx'
+rm /etc/nginx/sites-enabled/default
+
+cat << EOF >> /etc/nginx/sites-available/authorization
+server {
+  listen 80;
+  server_name $AUTH_LXC_IP;
+
+  location / {
+    include proxy_params;
+    proxy_pass http://unix:/home/ubuntu/authorization/authorization.sock;
+  }
+}
+EOF
+
+ln -s /etc/nginx/sites-available/authorization /etc/nginx/sites-enabled
+
+echo '>>>>>> Changing to ubuntu user'
+cd /home/ubuntu
+
+echo '>>>>>> Getting the code'
+git clone https://github.com/ed1000/osm_authorization.git authorization
+chown -R ubuntu:ubuntu authorization
+
+echo '>>>>>> Installing requirements'
+cd authorization/
+pip3 install -r requirements.txt
+
+echo '>>>>>> Configuring Authentication'
+sed -i "s/AUTHENTICATION_IP =.*/AUTHENTICATION_IP = '$AUTHENTICATION_IP'/" settings.py
+sed -i "s/ACCOUNTING_IP =.*/ACCOUNTING_IP = '$ACCOUNTING_IP'/" settings.py
+
+sed -i "s/AUTHENTICATION_USERNAME =.*/AUTHENTICATION_USERNAME = '$AUTHENTICATION_USERNAME'/" settings.py
+sed -i "s/AUTHENTICATION_PASSWORD =.*/AUTHENTICATION_PASSWORD = '$AUTHENTICATION_PASSWORD'/" settings.py
+
+sed -i "s%AUTHORIZATION_POLICY_FILE =.*%AUTHORIZATION_POLICY_FILE = '$AUTHORIZATION_POLICY_FILE'%" settings.py
+sed -i "s/REDIS_URL =.*/REDIS_URL = '$REDIS_URL'/" settings.py
+sed -i "s/REDIS_PORT =.*/REDIS_PORT = '$REDIS_PORT'/" settings.py
+
+sed -i "s/SERVICE_ROLE =.*/SERVICE_ROLE = '$SERVICE_ROLE'/" settings.py
+sed -i "s/SERVICE_PROJECT =.*/SERVICE_PROJECT = '$SERVICE_PROJECT'/" settings.py
+
+sed -i "s/KEYSTONE_URL =.*/KEYSTONE_URL = \'http:\/\/$KEYSTONE_LXC_IP:35357\/v3\/\'/" settings.py
+sed -i "s/KEYSTONE_USERNAME =.*/KEYSTONE_USERNAME = \'$KEYSTONE_USERNAME\'/" settings.py
+sed -i "s/KEYSTONE_PASSWORD =.*/KEYSTONE_PASSWORD = \'$KEYSTONE_PASSWORD\'/" settings.py
+sed -i "s/KEYSTONE_PROJECT =.*/KEYSTONE_PROJECT = \'$KEYSTONE_PROJECT\'/" settings.py
+sed -i "s/KEYSTONE_ADMIN_PROJECT =.*/KEYSTONE_ADMIN_PROJECT = \'$KEYSTONE_ADMIN_PROJECT\'/" settings.py
+sed -i "s/KEYSTONE_SERVICE_PROJECT =.*/KEYSTONE_SERVICE_PROJECT = \'$KEYSTONE_SERVICE_PROJECT\'/" settings.py
+sed -i "s/KEYSTONE_USER_DOMAIN_NAME =.*/KEYSTONE_USER_DOMAIN_NAME = \'$KEYSTONE_USER_DOMAIN_NAME\'/" settings.py
+sed -i "s/KEYSTONE_PROJECT_DOMAIN_NAME =.*/KEYSTONE_PROJECT_DOMAIN_NAME = \'$KEYSTONE_PROJECT_DOMAIN_NAME\'/" settings.py
+
+echo '>>>>>> Starting Gunicorn SystemD Unit'
+systemctl daemon-reload
+systemctl start gunicorn
+systemctl enable gunicorn
+systemctl restart nginx
+
